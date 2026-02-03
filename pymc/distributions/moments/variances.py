@@ -80,7 +80,7 @@ from pymc.distributions.multivariate import (
     StickBreakingWeightsRV,
     _LKJCholeskyCovRV,
 )
-from pymc.distributions.shape_utils import rv_size_is_none
+from pymc.distributions.shape_utils import rv_size_is_none, maybe_resize
 from pymc.exceptions import UndefinedMomentException
 
 __all__ = ["variance"]
@@ -98,12 +98,6 @@ def variance(rv: TensorVariable) -> TensorVariable:
     for which the value is to be derived.
     """
     return _variance(rv.owner.op, rv, *rv.owner.inputs)
-
-
-def maybe_resize(a: TensorVariable, size) -> TensorVariable:
-    if not rv_size_is_none(size):
-        a = pt.full(size, a)
-    return a
 
 
 @_variance.register(AsymmetricLaplaceRV)
