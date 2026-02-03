@@ -1,4 +1,4 @@
-#   Copyright 2024 - present The PyMC Developers
+#   Copyright 2026 - present The PyMC Developers
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -11,9 +11,6 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
-
-"""Variance dispatcher for pymc random variables."""
-
 from functools import singledispatch
 
 import numpy as np
@@ -31,7 +28,6 @@ from pytensor.tensor.random.basic import (
     GammaRV,
     GeometricRV,
     GumbelRV,
-    HalfCauchyRV,
     HalfNormalRV,
     HyperGeometricRV,
     InvGammaRV,
@@ -55,6 +51,7 @@ from pymc.distributions.continuous import (
     AsymmetricLaplaceRV,
     ExGaussianRV,
     FlatRV,
+    HalfCauchyRV,
     HalfFlatRV,
     HalfStudentTRV,
     KumaraswamyRV,
@@ -78,9 +75,10 @@ from pymc.distributions.multivariate import (
     MatrixNormalRV,
     MvStudentTRV,
     StickBreakingWeightsRV,
+    WishartRV,
     _LKJCholeskyCovRV,
 )
-from pymc.distributions.shape_utils import rv_size_is_none, maybe_resize
+from pymc.distributions.shape_utils import maybe_resize, rv_size_is_none
 from pymc.exceptions import UndefinedMomentException
 
 __all__ = ["variance"]
@@ -132,7 +130,14 @@ def binomial_variance(op, rv, rng, size, n, p):
 
 @_variance.register(CARRV)
 def car_variance(op, rv, rng, size, mu, W, alpha, tau, W_is_valid):
-    raise NotImplementedError("CAR variance not implemented due to complex covariance structure.")
+    W = pt.as_tensor_variable(W)
+    rho = pt.as_tensor_variable(alpha)
+    tau = pt.as_tensor_variable(tau)
+
+    D = pt.diag(pt.sum(W, axis=-1))
+    Q = tau * (D - rho * W)
+
+    return pt.linalg.inv(Q)
 
 
 @_variance.register(CategoricalRV)
@@ -142,7 +147,7 @@ def categorical_variance(op, rv, *args):
 
 @_variance.register(CauchyRV)
 def cauchy_variance(op, rv, rng, size, alpha, beta):
-    raise UndefinedMomentException("The variance of the Cauchy distribution is undefined")
+    return maybe_resize(pt.full_like(alpha, np.inf), size)
 
 
 @_variance.register(DiracDeltaRV)
@@ -186,8 +191,8 @@ def exponential_variance(op, rv, rng, size, mu):
 
 
 @_variance.register(FlatRV)
-def flat_variance(op, rv, *args):
-    raise UndefinedMomentException("The variance of the Flat distribution is undefined")
+def flat_variance(op, rv, rng, size):
+    return maybe_resize(pt.constant(np.inf, dtype="floatX"), size)
 
 
 @_variance.register(GammaRV)
@@ -225,13 +230,13 @@ def half_studentt_variance(op, rv, rng, size, nu, sigma):
 
 
 @_variance.register(HalfCauchyRV)
-def halfcauchy_variance(op, rv, rng, size, loc, beta):
-    raise UndefinedMomentException("The variance of the HalfCauchy distribution is undefined")
+def pymc_halfcauchy_variance(op, rv, rng, size, beta):
+    return maybe_resize(pt.full_like(beta, np.inf), size)
 
 
 @_variance.register(HalfFlatRV)
-def halfflat_variance(op, rv, *args):
-    raise UndefinedMomentException("The variance of the HalfFlat distribution is undefined")
+def halfflat_variance(op, rv, rng, size):
+    return maybe_resize(pt.constant(np.inf, dtype="floatX"), size)
 
 
 @_variance.register(HalfNormalRV)
@@ -255,10 +260,15 @@ def invgamma_variance(op, rv, rng, size, alpha, beta):
 
 
 @_variance.register(KroneckerNormalRV)
-def kronecker_normal_variance(op, rv, rng, size, mu, *covs):
-    raise NotImplementedError(
-        "KroneckerNormal variance not implemented due to complex Kronecker product covariance structure."
-    )
+def kronecker_normal_variance(op, rv, rng, size, mu, sigma, *covs):
+    from functools import reduce
+
+    cov = reduce(pt.linalg.kron, covs)
+    cov = cov + sigma**2 * pt.eye(cov.shape[-2])
+    if not rv_size_is_none(size):
+        cov_size = pt.concatenate([size, cov.shape[-2:]])
+        cov = pt.full(cov_size, cov)
+    return cov
 
 
 @_variance.register(KumaraswamyRV)
@@ -403,7 +413,9 @@ def polya_gamma_variance(op, rv, rng, size, h, z):
 
 
 @_variance.register(RiceRV)
-def rice_variance(op, rv, rng, size, nu, sigma):
+def rice_variance(op, rv, rng, size, b, sigma):
+    # b is the shape parameter, nu = b * sigma is the noncentrality parameter
+    nu = b * sigma
     nu_sigma_ratio = -(nu**2) / (2 * sigma**2)
     L_half = pt.exp(nu_sigma_ratio / 2) * (
         (1 - nu_sigma_ratio) * pt.i0(-nu_sigma_ratio / 2)
@@ -473,3 +485,13 @@ def wald_variance(op, rv, rng, size, mu, lam, _alpha):
 @_variance.register(WeibullBetaRV)
 def weibull_variance(op, rv, rng, size, alpha, beta):
     return maybe_resize(beta**2 * (pt.gamma(1 + 2 / alpha) - pt.gamma(1 + 1 / alpha) ** 2), size)
+
+
+@_variance.register(WishartRV)
+def wishart_variance(op, rv, rng, size, nu, V):
+    diag_V = pt.diag(V)
+    var = nu * (V**2 + diag_V[:, None] * diag_V[None, :])
+    if not rv_size_is_none(size):
+        var_size = pt.concatenate([size, V.shape[-2:]])
+        var = pt.full(var_size, var)
+    return var

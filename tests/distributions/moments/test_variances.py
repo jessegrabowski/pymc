@@ -12,6 +12,8 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -42,11 +44,13 @@ from scipy.stats import (
     norm,
     pareto,
     poisson,
+    rice,
     skewnorm,
     t,
     triang,
     uniform,
     weibull_min,
+    wishart,
 )
 
 from pymc import (
@@ -94,6 +98,7 @@ from pymc import (
     Pareto,
     Poisson,
     PolyaGamma,
+    Rice,
     SkewNormal,
     SkewStudentT,
     StickBreakingWeights,
@@ -157,6 +162,7 @@ def assert_batched_variance_consistent(dist, dist_params, base_variance):
         [Normal, norm, {"mu": 2, "sigma": 2}, {"loc": 2, "scale": 2}],
         [Pareto, pareto, {"alpha": 5, "m": 2}, {"b": 5, "scale": 2}],
         [Poisson, poisson, {"mu": 20}, {"mu": 20}],
+        [Rice, rice, {"b": 1, "sigma": 2}, {"b": 1, "scale": 2}],
         [SkewNormal, skewnorm, {"mu": 2, "sigma": 2, "alpha": 2}, {"loc": 2, "scale": 2, "a": 2}],
         [
             SkewStudentT,
@@ -186,6 +192,9 @@ def test_univariate_variance_equal_to_scipy(dist, scipy_equiv, dist_params, scip
     assert_batched_variance_consistent(dist, dist_params, pymc_var)
 
 
+COV_3x3 = np.array([[2.0, 0.5, -0.3], [0.5, 1.5, 0.2], [-0.3, 0.2, 1.0]])
+
+
 @pytest.mark.parametrize(
     ["dist", "dist_params", "expected_cov", "support_dim"],
     [
@@ -197,14 +206,14 @@ def test_univariate_variance_equal_to_scipy(dist, scipy_equiv, dist_params, scip
         ],
         [
             MvNormal,
-            {"mu": np.ones(3), "cov": np.eye(3)},
-            lambda: np.eye(3),
+            {"mu": np.ones(3), "cov": COV_3x3},
+            lambda: COV_3x3,
             3,
         ],
         [
             MvStudentT,
-            {"mu": np.ones(3), "cov": np.eye(3), "nu": 4},
-            lambda: np.eye(3) * 4 / (4 - 2),
+            {"mu": np.ones(3), "cov": COV_3x3, "nu": 4},
+            lambda: COV_3x3 * 4 / (4 - 2),
             3,
         ],
     ],
@@ -246,6 +255,63 @@ def test_variance_equal_expected(dist, dist_params, expected):
     assert_batched_variance_consistent(dist, dist_params, pymc_var)
 
 
+def test_car_variance():
+    from scipy.stats import multivariate_normal
+
+    W = np.array([[0, 1, 1], [1, 0, 1], [1, 1, 0]], dtype=float)
+    alpha = 0.5
+    tau = 2.0
+    mu = np.zeros(3)
+
+    rv = CAR.dist(mu=mu, W=W, alpha=alpha, tau=tau)
+    pymc_var = variance(rv).eval()
+
+    # Definition of CAR covariance matrix
+    D = np.diag(W.sum(axis=1))
+    Q = tau * (D - alpha * W)
+    car_cov = np.linalg.inv(Q)
+
+    mvn = multivariate_normal(mean=mu, cov=car_cov)
+    expected = mvn.cov
+
+    np.testing.assert_almost_equal(pymc_var, expected)
+
+
+def test_kronecker_normal_variance():
+    from functools import reduce
+
+    from scipy.stats import multivariate_normal
+
+    K1 = np.array([[2.0, 0.5], [0.5, 1.5]])
+    K2 = np.array([[1.0, 0.3, -0.1], [0.3, 1.5, 0.2], [-0.1, 0.2, 1.0]])
+    sigma = 0.1
+    mu = np.zeros(6)
+
+    rv = KroneckerNormal.dist(mu=mu, covs=[K1, K2], sigma=sigma)
+    pymc_var = variance(rv).eval()
+
+    expected_cov = reduce(np.kron, [K1, K2]) + sigma**2 * np.eye(6)
+    mvn = multivariate_normal(mean=mu, cov=expected_cov)
+
+    np.testing.assert_almost_equal(pymc_var, mvn.cov)
+
+
+def test_wishart_variance():
+    nu = 10
+    V = np.array([[2.0, 0.5], [0.5, 1.5]])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from pymc import Wishart
+
+        rv = Wishart.dist(nu=nu, V=V)
+
+    pymc_var = variance(rv).eval()
+    scipy_var = wishart(df=nu, scale=V).var()
+
+    np.testing.assert_almost_equal(pymc_var, scipy_var)
+
+
 @pytest.mark.parametrize(
     ["dist", "dist_params"],
     [
@@ -266,23 +332,24 @@ def test_variance_computes_without_error(dist, dist_params):
 @pytest.mark.parametrize(
     ["dist", "dist_params"],
     [
-        [CAR, {"mu": np.ones(3), "W": np.eye(3), "alpha": 0.5, "tau": 1}],
         [Cauchy, {"alpha": 1, "beta": 1}],
         [HalfCauchy, {"beta": 1.0}],
-        [LogitNormal, {"mu": 2, "sigma": 1}],
         [Flat, {}],
         [HalfFlat, {}],
+    ],
+)
+def test_variance_infinite(dist, dist_params):
+    """Test that distributions with infinite variance return inf."""
+    rv = dist.dist(**dist_params)
+    pymc_var = variance(rv).eval()
+    assert np.isinf(pymc_var)
+
+
+@pytest.mark.parametrize(
+    ["dist", "dist_params"],
+    [
+        [LogitNormal, {"mu": 2, "sigma": 1}],
         [Categorical, {"p": [0.1, 0.9]}],
-        [
-            KroneckerNormal,
-            {
-                "mu": np.ones(6),
-                "covs": [
-                    np.array([[1.0, 0.5], [0.5, 2]]),
-                    np.array([[1.0, 0.4, 0.2], [0.4, 2, 0.3], [0.2, 0.3, 1]]),
-                ],
-            },
-        ],
         [
             LKJCholeskyCov,
             {"eta": 1, "n": 3, "sd_dist": DiracDelta.dist(1), "compute_corr": False},
