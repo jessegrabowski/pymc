@@ -147,7 +147,7 @@ def categorical_variance(op, rv, *args):
 
 @_variance.register(CauchyRV)
 def cauchy_variance(op, rv, rng, size, alpha, beta):
-    return maybe_resize(pt.full_like(alpha, np.inf), size)
+    raise UndefinedMomentException("The variance of the Cauchy distribution is undefined")
 
 
 @_variance.register(DiracDeltaRV)
@@ -192,7 +192,7 @@ def exponential_variance(op, rv, rng, size, mu):
 
 @_variance.register(FlatRV)
 def flat_variance(op, rv, rng, size):
-    return maybe_resize(pt.constant(np.inf, dtype="floatX"), size)
+    raise UndefinedMomentException("The variance of Flat distribution is undefined")
 
 
 @_variance.register(GammaRV)
@@ -231,12 +231,12 @@ def half_studentt_variance(op, rv, rng, size, nu, sigma):
 
 @_variance.register(HalfCauchyRV)
 def pymc_halfcauchy_variance(op, rv, rng, size, beta):
-    return maybe_resize(pt.full_like(beta, np.inf), size)
+    raise UndefinedMomentException("The variance of the HalfCauchy distribution is undefined")
 
 
 @_variance.register(HalfFlatRV)
 def halfflat_variance(op, rv, rng, size):
-    return maybe_resize(pt.constant(np.inf, dtype="floatX"), size)
+    raise UndefinedMomentException("The variance of the HalfFlat distribution is undefined")
 
 
 @_variance.register(HalfNormalRV)
