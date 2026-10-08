@@ -20,6 +20,7 @@ import numpy as np
 import pytensor
 import pytensor.tensor as pt
 
+from pytensor.assumptions import assume
 from pytensor.graph.basic import Apply
 from pytensor.graph.op import Op
 from pytensor.tensor import (
@@ -491,17 +492,15 @@ def expand_packed_triangular(n, packed, lower=True, diagonal_only=False):
     elif lower:
         out = pt.zeros((n, n), dtype=pytensor.config.floatX)
         idxs = np.tril_indices(n)
-        # tag as lower triangular to enable pytensor rewrites
+        # declare as lower triangular to enable pytensor rewrites
         out = pt.set_subtensor(out[idxs], packed)
-        out.tag.lower_triangular = True
-        return out
+        return assume(out, lower_triangular=True)
     elif not lower:
         out = pt.zeros((n, n), dtype=pytensor.config.floatX)
         idxs = np.triu_indices(n)
-        # tag as upper triangular to enable pytensor rewrites
+        # declare as upper triangular to enable pytensor rewrites
         out = pt.set_subtensor(out[idxs], packed)
-        out.tag.upper_triangular = True
-        return out
+        return assume(out, upper_triangular=True)
 
 
 class BatchedDiag(Op):

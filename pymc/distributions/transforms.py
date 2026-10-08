@@ -20,6 +20,7 @@ import numpy as np
 import pytensor.tensor as pt
 
 from numpy.lib.array_utils import normalize_axis_tuple
+from pytensor.assumptions import assume
 from pytensor.graph import Op
 from pytensor.tensor import TensorLike, TensorVariable
 
@@ -466,9 +467,9 @@ class CholeskyCovTransform(Transform):
        the diagonal entries (so ``L_kk > 0``).
     2. Form ``X = L @ L.T``, the SPD matrix.
 
-    The lower-triangular ``L`` produced inside ``backward`` is tagged with
-    ``lower_triangular = True`` so PyTensor's ``cholesky_ldotlt`` rewrite eliminates
-    any subsequent ``cholesky(L @ L.T)`` calls (e.g. inside a Cholesky-based
+    The lower-triangular ``L`` produced inside ``backward`` is declared lower-triangular
+    through the assumptions system (``assume``) so PyTensor's ``cholesky_ldotlt`` rewrite
+    eliminates any subsequent ``cholesky(L @ L.T)`` calls (e.g. inside a Cholesky-based
     ``Wishart.logp``), avoiding a redundant decomposition at runtime.
 
     The Jacobian of the composite map (free reals :math:`\to L \to L L^\top`) is
@@ -524,8 +525,8 @@ class CholeskyCovTransform(Transform):
         L_shape = (*value.shape[:-1], n, n)
         L = pt.zeros(L_shape, dtype=value.dtype)
         L = L[..., self.tril_idxs[0], self.tril_idxs[1]].set(value_pos)
-        # Tag L as lower-triangular so cholesky(L @ L.mT) → L is rewritten away.
-        L.tag.lower_triangular = True
+        # Declare L lower-triangular so cholesky(L @ L.mT) -> L is rewritten away.
+        L = assume(L, lower_triangular=True)
         return L @ L.mT
 
     def forward(self, value, *inputs):
