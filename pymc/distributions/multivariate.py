@@ -20,7 +20,7 @@ import numpy as np
 import pytensor
 import pytensor.tensor as pt
 
-from pytensor.assumptions import POSITIVE_DEFINITE, check_assumption
+from pytensor.assumptions import POSITIVE_DEFINITE, assume, check_assumption
 from pytensor.graph import node_rewriter
 from pytensor.graph.basic import Variable
 from pytensor.graph.rewriting.basic import copy_stack_trace
@@ -139,11 +139,12 @@ def quaddist_matrix(cov=None, chol=None, tau=None, lower=True, *args, **kwargs):
         cov = pt.as_tensor_variable(cov)
         if cov.ndim < 2:
             raise ValueError("cov must be at least two dimensional.")
+        cov = assume(cov, positive_definite=True)
     elif tau is not None:
         tau = pt.as_tensor_variable(tau)
         if tau.ndim < 2:
             raise ValueError("tau must be at least two dimensional.")
-        cov = matrix_inverse(tau)
+        cov = matrix_inverse(assume(tau, positive_definite=True))
     else:
         chol = pt.as_tensor_variable(chol)
         if chol.ndim < 2:
@@ -152,8 +153,6 @@ def quaddist_matrix(cov=None, chol=None, tau=None, lower=True, *args, **kwargs):
         if not lower:
             chol = chol.mT
 
-        # tag as lower triangular to enable pytensor rewrites of chol(l.l') -> l
-        chol.tag.lower_triangular = True
         cov = chol @ chol.mT
 
     return cov
@@ -166,27 +165,36 @@ def _logdet_from_cholesky(chol: TensorVariable) -> tuple[TensorVariable, TensorV
     return logdet, posdef
 
 
-def quaddist_chol(value, mu, cov):
-    """Compute (x - mu).T @ Sigma^-1 @ (x - mu) and the logdet of Sigma."""
+def quaddist_logdet(value, mu, cov):
+    """Compute the MvNormal quadratic form, log determinant, and a posdef check.
+
+    The density formula written literally, with positive-definiteness carried as an
+    assumption. Rewrites turn this into Cholesky-based computations; the posdef
+    check reads nan off ``logdet`` so it travels with whatever rewrites produce.
+
+    Returns
+    -------
+    quaddist : TensorVariable
+        ``(value - mu).T @ inv(cov) @ (value - mu)``, batched over leading dims.
+    logdet : TensorVariable
+        ``log(det(cov))``.
+    posdef : TensorVariable
+        Boolean check that ``cov`` is positive definite, nan-based after rewriting.
+    """
     if value.ndim == 0:
         raise ValueError("Value can't be a scalar")
-    if value.ndim == 1:
-        onedim = True
-        value = value[None, :]
-    else:
-        onedim = False
-
-    chol_cov = pt.linalg.cholesky(cov, lower=True)
-    logdet, posdef = _logdet_from_cholesky(chol_cov)
 
     delta = value - mu
-    delta_trans = solve_lower(chol_cov, delta, b_ndim=1)
-    quaddist = (delta_trans**2).sum(axis=-1)
 
-    if onedim:
-        return quaddist[0], logdet, posdef
-    else:
-        return quaddist, logdet, posdef
+    # RV broadcasting pads cov with leading length-1 dims, which blinds every
+    # structural rewrite; dropping them is a no-op under broadcasting.
+    cov = assume(_strip_left_expand_dims(cov), positive_definite=True)
+    quaddist = (delta * pt.matvec(matrix_inverse(cov), delta)).sum(axis=-1)
+    logdet = pt.log(det(cov))
+
+    posdef = ~pt.isnan(logdet)
+
+    return quaddist, logdet, posdef
 
 
 def _strip_left_expand_dims(var: TensorVariable) -> TensorVariable:
@@ -360,11 +368,11 @@ class MvNormal(Continuous):
         -------
         TensorVariable
         """
-        quaddist, logdet, posdef = quaddist_chol(value, mu, cov)
+        quaddist, logdet, posdef = quaddist_logdet(value, mu, cov)
         k = value.shape[-1].astype("floatX")
         norm = -0.5 * k * np.log(2 * np.pi)
         return check_parameters(
-            norm - 0.5 * quaddist - logdet,
+            norm - 0.5 * quaddist - 0.5 * logdet,
             posdef,
             msg="posdef covariance",
         )
@@ -577,12 +585,12 @@ class MvStudentT(Continuous):
         -------
         TensorVariable
         """
-        quaddist, logdet, ok = quaddist_chol(value, mu, scale)
+        quaddist, logdet, ok = quaddist_logdet(value, mu, scale)
         k = value.shape[-1].astype("floatX")
 
         norm = gammaln((nu + k) / 2.0) - gammaln(nu / 2.0) - 0.5 * k * pt.log(nu * np.pi)
         inner = -(nu + k) / 2.0 * pt.log1p(quaddist / nu)
-        res = norm + inner - logdet
+        res = norm + inner - 0.5 * logdet
 
         return check_parameters(res, ok, nu > 0, msg="posdef, nu > 0")
 
