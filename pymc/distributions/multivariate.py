@@ -20,9 +20,12 @@ import numpy as np
 import pytensor
 import pytensor.tensor as pt
 
+from pytensor.assumptions import POSITIVE_DEFINITE, check_assumption
 from pytensor.graph import node_rewriter
 from pytensor.graph.basic import Variable
+from pytensor.graph.rewriting.basic import copy_stack_trace
 from pytensor.raise_op import Assert
+from pytensor.scalar import Log
 from pytensor.tensor import (
     TensorConstant,
     TensorVariable,
@@ -30,9 +33,9 @@ from pytensor.tensor import (
     get_underlying_scalar_constant_value,
     sigmoid,
 )
-from pytensor.tensor.elemwise import DimShuffle
+from pytensor.tensor.elemwise import DimShuffle, Elemwise
 from pytensor.tensor.exceptions import NotScalarConstantError
-from pytensor.tensor.linalg import eigh, solve_triangular
+from pytensor.tensor.linalg import cholesky, det, eigh, solve_triangular
 from pytensor.tensor.linalg import inv as matrix_inverse
 from pytensor.tensor.random import chisquare
 from pytensor.tensor.random.basic import MvNormalRV, dirichlet, multinomial, multivariate_normal
@@ -40,6 +43,7 @@ from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.utils import (
     normalize_size_param,
 )
+from pytensor.tensor.rewriting.basic import register_stabilize
 from pytensor.utils import lazy_scipy_module
 
 import pymc as pm
@@ -183,6 +187,77 @@ def quaddist_chol(value, mu, cov):
         return quaddist[0], logdet, posdef
     else:
         return quaddist, logdet, posdef
+
+
+def _strip_left_expand_dims(var: TensorVariable) -> TensorVariable:
+    """Look through DimShuffles that only add leading broadcast axes.
+
+    Blockwise batching pushes ``expand_dims`` onto the matrix inputs of batched
+    nodes, which would otherwise hide the matrix from structural matchers like
+    ``cholesky_ldotlt`` and keep Cholesky nodes of the same matrix from merging.
+    """
+    while (
+        var.owner is not None
+        and isinstance(var.owner.op, DimShuffle)
+        and var.owner.op.is_left_expand_dims
+    ):
+        var = var.owner.inputs[0]
+    return var
+
+
+@register_stabilize
+@node_rewriter([det])
+def logdet_of_positive_definite(fgraph, node):
+    """Rewrite log(det(X)) with X assumed positive definite through a Cholesky factor.
+
+    ``2 * sum(log(diag(cholesky(X))))`` never forms the determinant itself, so it
+    cannot overflow, and the Cholesky node it introduces merges with the one
+    pytensor's ``psd_solve_to_chol_solve`` emits for solves against the same matrix.
+    Fires only when every client of the determinant is a ``log``, looking through
+    DimShuffles that merely add broadcast axes (``local_dimshuffle_lift`` legally
+    turns ``expand_dims(log(det(X)))`` into ``log(expand_dims(det(X)))``), so the
+    determinant is never computed twice. Runs in stabilize, before
+    ``slogdet_specialization`` can route the determinant through an LU factorization.
+    """
+    [X] = node.inputs
+    if not check_assumption(fgraph, X, POSITIVE_DEFINITE):
+        return None
+
+    log_clients = _log_clients_through_padding(fgraph, node.outputs[0])
+    if not log_clients:
+        return None
+
+    diag = pt.diagonal(cholesky(_strip_left_expand_dims(X), lower=True), axis1=-2, axis2=-1)
+    logdet = 2.0 * pt.log(diag).sum(axis=-1)
+
+    replacements = {}
+    for old in log_clients:
+        new = logdet
+        if new.type != old.type:
+            new = pt.broadcast_to(new, tuple(old.shape))
+        copy_stack_trace(old, new)
+        replacements[old] = new
+    return replacements
+
+
+def _log_clients_through_padding(fgraph, var) -> list[TensorVariable] | None:
+    """The ``log`` clients of ``var``, recursing through left expand_dims clients.
+
+    Returns None when any client is neither, so the caller can require the log to be
+    the only consumer.
+    """
+    out = []
+    for client, _ in fgraph.clients[var]:
+        if isinstance(client.op, Elemwise) and isinstance(client.op.scalar_op, Log):
+            out.append(client.outputs[0])
+        elif isinstance(client.op, DimShuffle) and client.op.is_left_expand_dims:
+            sub = _log_clients_through_padding(fgraph, client.outputs[0])
+            if sub is None:
+                return None
+            out.extend(sub)
+        else:
+            return None
+    return out
 
 
 class MvNormal(Continuous):
