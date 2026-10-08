@@ -38,7 +38,7 @@ from pytensor.tensor.exceptions import NotScalarConstantError
 from pytensor.tensor.linalg import cholesky, det, eigh, solve_triangular
 from pytensor.tensor.linalg import inv as matrix_inverse
 from pytensor.tensor.random import chisquare
-from pytensor.tensor.random.basic import MvNormalRV, dirichlet, multinomial, multivariate_normal
+from pytensor.tensor.random.basic import dirichlet, multinomial, multivariate_normal
 from pytensor.tensor.random.op import RandomVariable
 from pytensor.tensor.random.utils import (
     normalize_size_param,
@@ -80,9 +80,6 @@ from pymc.distributions.transforms import (
     _default_transform,
 )
 from pymc.logprob.abstract import _logprob
-from pymc.logprob.rewriting import (
-    specialization_ir_rewrites_db,
-)
 from pymc.math import kron_diag, kron_dot
 from pymc.pytensorf import normalize_rng_param
 from pymc.util import check_dist_not_registered
@@ -156,13 +153,6 @@ def quaddist_matrix(cov=None, chol=None, tau=None, lower=True, *args, **kwargs):
         cov = chol @ chol.mT
 
     return cov
-
-
-def _logdet_from_cholesky(chol: TensorVariable) -> tuple[TensorVariable, TensorVariable]:
-    diag = pt.diagonal(chol, axis1=-2, axis2=-1)
-    logdet = pt.log(diag).sum(axis=-1)
-    posdef = pt.all(diag > 0, axis=-1)
-    return logdet, posdef
 
 
 def quaddist_logdet(value, mu, cov):
@@ -388,74 +378,6 @@ class SymbolicMVNormalUsedInternally(SymbolicRandomVariable):
     def rebuild_rv(self, *args, **kwargs):
         # rv_op is a classmethod, so it doesn't have access to the instance method
         return self.rv_op(*args, method=self.method, **kwargs)
-
-
-class PrecisionMvNormalRV(SymbolicMVNormalUsedInternally):
-    r"""A specialized multivariate normal random variable defined in terms of precision.
-
-    This class is introduced during specialization logprob rewrites, and not meant to be used directly.
-    """
-
-    name = "precision_multivariate_normal"
-    extended_signature = "[rng],[size],(n),(n,n)->(n)"
-    _print_name = ("PrecisionMultivariateNormal", "\\operatorname{PrecisionMultivariateNormal}")
-
-    @classmethod
-    def rv_op(cls, mean, tau, *, method: str = "cholesky", rng=None, size=None):
-        rng = normalize_rng_param(rng)
-        size = normalize_size_param(size)
-        cov = pt.linalg.inv(tau)
-        next_rng, draws = multivariate_normal(
-            mean, cov, size=size, rng=rng, method=method, return_next_rng=True
-        )
-        return cls(
-            inputs=[rng, size, mean, tau],
-            outputs=[next_rng, draws],
-            method=method,
-        )(rng, size, mean, tau)
-
-
-@_logprob.register
-def precision_mv_normal_logp(op: PrecisionMvNormalRV, value, rng, size, mean, tau, **kwargs):
-    [value] = value
-    k = value.shape[-1].astype("floatX")
-
-    delta = value - mean
-    quadratic_form = delta.T @ tau @ delta
-    logdet, posdef = _logdet_from_cholesky(pt.linalg.cholesky(tau, lower=True))
-    logp = -0.5 * (k * pt.log(2 * np.pi) + quadratic_form) + logdet
-
-    return check_parameters(
-        logp,
-        posdef,
-        msg="posdef precision",
-    )
-
-
-@node_rewriter(tracks=[MvNormalRV])
-def mv_normal_to_precision_mv_normal(fgraph, node):
-    """Replace MvNormal(mu, inv(tau)) -> PrecisionMvNormal(mu, tau).
-
-    This is introduced in logprob rewrites to provide a more efficient logp for a MvNormal
-    that is defined by a precision matrix.
-
-    Note: This won't be introduced when calling `pm.logp` as that will dispatch directly
-    without triggering the logprob rewrites.
-    """
-    rng, size, mu, cov = node.inputs
-    if cov.owner and cov.owner.op == matrix_inverse:
-        tau = cov.owner.inputs[0]
-        return PrecisionMvNormalRV.rv_op(
-            mu, tau, size=size, rng=rng, method=node.op.method
-        ).owner.outputs
-    return None
-
-
-specialization_ir_rewrites_db.register(
-    mv_normal_to_precision_mv_normal.__name__,
-    mv_normal_to_precision_mv_normal,
-    "basic",
-)
 
 
 class MvStudentTRV(SymbolicMVNormalUsedInternally):
